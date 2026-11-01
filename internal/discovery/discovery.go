@@ -17,6 +17,7 @@ package discovery
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"time"
@@ -310,11 +311,10 @@ type cacheReconciler struct {
 	factoryGenerator func() ([]customresource.RegistryFactory, error)
 	createClients    func(factories ...customresource.RegistryFactory) (map[string]any, error)
 
-	// The enabled CR set and cache revision jointly skip no-op rebuilds. The
-	// revision is needed because a CRD can be deleted and re-added between ticks
-	// with the same GVR while its reflector stop channel changes identity.
-	lastAppliedEnabled  []string
-	lastAppliedRevision uint64
+	// The enabled CR set and the stop channels of their GVKs at the last
+	// rebuild, compared on each tick to skip no-op rebuilds.
+	lastAppliedEnabled   []string
+	lastAppliedStopChans map[string]chan struct{}
 
 	// Failed rebuilds are retried with exponential backoff so a persistent error
 	// (e.g. an invalid custom resource state config) does not retry and log on
@@ -362,9 +362,17 @@ func (c *cacheReconciler) reconcile(ctx context.Context) {
 	// Check if cache has been updated.
 	shouldGenerateMetrics := false
 	var observedRevision uint64
+	var observedStopChans map[string]chan struct{}
 	r.SafeRead(func() {
 		shouldGenerateMetrics = r.WasUpdated
 		observedRevision = r.cacheRevision
+		// Take the stop channels before the rebuild hands them to the reflectors.
+		// A channel replaced after this point then differs from the applied one
+		// on the next tick, instead of being recorded as applied while the
+		// reflectors still hold the closed one.
+		if shouldGenerateMetrics {
+			observedStopChans = maps.Clone(r.GVKToReflectorStopChanMap)
+		}
 	})
 	if !shouldGenerateMetrics {
 		return
@@ -375,7 +383,7 @@ func (c *cacheReconciler) reconcile(ctx context.Context) {
 	if observedRevision != c.failedRevision {
 		c.consecutiveFailures = 0
 	}
-	applied, err := c.generateMetrics(ctx, observedRevision)
+	applied, err := c.generateMetrics(ctx, observedRevision, observedStopChans)
 	if err != nil {
 		c.consecutiveFailures++
 		c.failedRevision = observedRevision
@@ -392,8 +400,8 @@ func (c *cacheReconciler) reconcile(ctx context.Context) {
 
 // generateMetrics rebuilds the custom resource stores for the factories that
 // the configuration currently resolves to, unless neither the resolved
-// resources nor the cache revision changed since the last rebuild.
-func (c *cacheReconciler) generateMetrics(ctx context.Context, observedRevision uint64) (applied bool, err error) {
+// resources nor the stop channels of their GVKs changed since the last rebuild.
+func (c *cacheReconciler) generateMetrics(ctx context.Context, observedRevision uint64, observedStopChans map[string]chan struct{}) (applied bool, err error) {
 	r := c.discoverer
 	// Get families for discovered factories.
 	customFactories, err := c.factoryGenerator()
@@ -401,10 +409,13 @@ func (c *cacheReconciler) generateMetrics(ctx context.Context, observedRevision 
 		// Preserve WasUpdated so a later tick retries.
 		return false, err
 	}
-	// Update the list of enabled custom resources.
+	// Update the list of enabled custom resources, and collect the stop channels
+	// that their reflectors will be started with.
 	var enabledCustomResources []string
+	stopChans := make(map[string]chan struct{}, len(customFactories))
 	for _, factory := range customFactories {
-		gvr, err := util.GVRFromType(factory.Name(), factory.ExpectedType())
+		expectedType := factory.ExpectedType()
+		gvr, err := util.GVRFromType(factory.Name(), expectedType)
 		if err != nil {
 			klog.ErrorS(err, "failed to update custom resource stores")
 		}
@@ -415,9 +426,23 @@ func (c *cacheReconciler) generateMetrics(ctx context.Context, observedRevision 
 			gvrString = factory.Name()
 		}
 		enabledCustomResources = append(enabledCustomResources, gvrString)
+		// Key the channels the same way startReflector looks them up.
+		if u, ok := expectedType.(*unstructured.Unstructured); ok {
+			gvk := u.GroupVersionKind().String()
+			stopChans[gvk] = observedStopChans[gvk]
+		}
 	}
 	sort.Strings(enabledCustomResources)
-	if slices.Equal(enabledCustomResources, c.lastAppliedEnabled) && observedRevision == c.lastAppliedRevision {
+	// Rebuild only when either changed since the last rebuild:
+	//   - the set of enabled custom resources, or
+	//   - the stop channel of a resolved GVK. A stop channel is closed only when
+	//     its GVK leaves the cache or its plural changes, and a closed channel
+	//     never comes back, so a different channel means that the reflectors of
+	//     that GVK have been stopped, even if the CRD has been re-added with the
+	//     same GVR since.
+	//
+	// Changes to CRDs that the configuration does not resolve to change neither.
+	if slices.Equal(enabledCustomResources, c.lastAppliedEnabled) && maps.Equal(stopChans, c.lastAppliedStopChans) {
 		r.SafeWrite(func() {
 			if r.cacheRevision == observedRevision {
 				r.WasUpdated = false
@@ -452,7 +477,7 @@ func (c *cacheReconciler) generateMetrics(ctx context.Context, observedRevision 
 		return false, err
 	}
 	c.lastAppliedEnabled = slices.Clone(enabledCustomResources)
-	c.lastAppliedRevision = observedRevision
+	c.lastAppliedStopChans = stopChans
 	// Clear only the revision we applied. If discovery changed while clients
 	// were being created, leave the flag set for another reconciliation.
 	r.SafeWrite(func() {
